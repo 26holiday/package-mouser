@@ -143,18 +143,69 @@ mouser --json | jq '.targets[] | select(.size_bytes > 1000000000)'
 }
 ```
 
-## Installation
+## Building
 
-### From source
+### Prerequisites
+
+- **Zig 0.15 or later** — [Download](https://ziglang.org/download/)
+- Git (for cloning)
+- ~500MB disk space (for build cache)
+
+### Clone & Setup
+
 ```bash
-git clone https://github.com/yourusername/package-mouser
+git clone https://github.com/26holiday/package-mouser
 cd package-mouser
-zig build -Doptimize=ReleaseFast
+```
+
+### Development Build
+
+Fast, with debug symbols (slower runtime, smaller binary):
+
+```bash
+zig build
 ./zig-out/bin/mouser --help
 ```
 
-### Pre-built binary
-Download from [Releases](https://github.com/yourusername/package-mouser/releases)
+Or build & run together:
+
+```bash
+zig build run -- --help
+```
+
+### Release Build (Optimized)
+
+Fast runtime, fully optimized (slower compile):
+
+```bash
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/mouser
+```
+
+For maximum optimization (very slow compile):
+
+```bash
+zig build -Doptimize=ReleaseSmall
+```
+
+### Clean Build
+
+Remove cache and rebuild from scratch:
+
+```bash
+rm -rf zig-out .zig-cache
+zig build -Doptimize=ReleaseFast
+```
+
+### Run Tests (if added later)
+
+```bash
+zig build test
+```
+
+### Pre-built Binaries
+
+Download pre-compiled binaries from [Releases](https://github.com/26holiday/package-mouser/releases)
 
 ## Performance
 
