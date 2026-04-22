@@ -47,7 +47,19 @@ Written in Zig. Single binary. Zero dependencies.
 - `--threads N`: Control parallelism for size measurement
 - `--help`: Show all options
 
-## Usage Examples
+## Usage
+
+### Scanning Behavior
+
+**`mouser` recursively scans ALL subdirectories** starting from the specified path (or current directory). It digs through the entire directory tree looking for target directories (node_modules, .venv, target/, etc.).
+
+Examples:
+- `mouser` — scans current dir and all subdirs recursively
+- `mouser ~/projects` — scans ~/projects and all subdirs below it
+- `mouser --depth 2` — scans current dir, down to 2 levels deep (faster, top-level only)
+- `mouser --no-size` — recursive scan, but skip size calculation (much faster)
+
+### Usage Examples
 
 ### List all dependencies in current directory
 ```bash
@@ -206,6 +218,34 @@ zig build test
 ### Pre-built Binaries
 
 Download pre-compiled binaries from [Releases](https://github.com/26holiday/package-mouser/releases)
+
+### Add to System PATH (Optional)
+
+Make `mouser` available from any directory:
+
+**Windows (PowerShell as Admin):**
+```powershell
+$project = "C:\Users\Shahzaib\Desktop\package-mouser\zig-out\bin"
+[Environment]::SetEnvironmentVariable("PATH", $env:PATH + ";$project", "User")
+# Restart terminal
+mouser --help
+```
+
+**macOS/Linux:**
+```bash
+export PATH="$PATH:$HOME/path/to/package-mouser/zig-out/bin"
+# Add above line to ~/.bashrc or ~/.zshrc for persistence
+mouser --help
+```
+
+**Alternative: Copy binary to PATH**
+```bash
+# Windows
+copy zig-out\bin\mouser.exe C:\Windows\System32\
+
+# macOS/Linux
+sudo cp zig-out/bin/mouser /usr/local/bin/
+```
 
 ## Performance
 
