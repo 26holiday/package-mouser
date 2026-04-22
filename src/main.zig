@@ -134,19 +134,20 @@ fn calcDirSize(alloc: Allocator, path: []const u8) u64 {
         var dir = fs.openDirAbsolute(cur, .{ .iterate = true }) catch continue;
         defer dir.close();
         var it = dir.iterate();
-        while (it.next() catch null) |de| {
+        while (true) {
+            const maybe_de = it.next() catch break; // skip bad entry, don't abort loop
+            const de = maybe_de orelse break;
             switch (de.kind) {
-                .file, .sym_link => {
-                    var f = dir.openFile(de.name, .{}) catch continue;
-                    defer f.close();
-                    const st = f.stat() catch continue;
+                .file => {
+                    // statFile avoids opening reparse points (OneDrive, junctions, AppX)
+                    const st = dir.statFile(de.name) catch continue;
                     total += st.size;
                 },
                 .directory => {
                     const child = fs.path.join(alloc, &.{ cur, de.name }) catch continue;
                     stack.append(child) catch { alloc.free(child); };
                 },
-                else => {},
+                else => {}, // skip sym_links and reparse points — no open, no panic
             }
         }
     }
