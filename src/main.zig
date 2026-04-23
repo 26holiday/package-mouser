@@ -262,51 +262,108 @@ const Config = struct {
     show_help: bool = false,
 };
 
-const help_text =
-    \\mouser v1.0.0  —  find and nuke dependency/build directories
-    \\
-    \\USAGE:
-    \\  mouser [OPTIONS] [PATH]
-    \\
-    \\ARGS:
-    \\  PATH                  Root directory to scan (default: current dir)
-    \\
-    \\SCAN OPTIONS:
-    \\  -d, --depth N         Max scan depth
-    \\  -f, --filter TYPE     all | python | node | rust  (default: all)
-    \\      --target A,B,...  Extra directory names to scan for
-    \\      --min-size SIZE   Min size to include (e.g. 50MB, 1.5GiB)
-    \\      --older-than N   Only dirs not touched in N days
-    \\      --no-size         Skip size calculation (much faster)
-    \\
-    \\OUTPUT OPTIONS:
-    \\  -s, --sort-size       Sort by size (largest first)
-    \\      --sort-age        Sort by last modified (oldest first)
-    \\      --json            Output as JSON
-    \\      --export FILE     Export to .json or .csv file
-    \\      --no-color        Disable ANSI colors
-    \\
-    \\DELETE OPTIONS:
-    \\      --delete          Delete all found dirs (confirms first)
-    \\  -i, --interactive     Numbered list — pick which to delete
-    \\      --dry-run         Show what would be deleted, don't act
-    \\
-    \\MISC:
-    \\  -t, --threads N       Threads for size calc (default: 4)
-    \\  -h, --help            This help
-    \\
-    \\DETECTED BY DEFAULT:
-    \\  Python   .venv  venv  my_venv  .virtualenv
-    \\  Node     node_modules  .next  .nuxt
-    \\  Rust     target/  (only when Cargo.toml exists in parent)
-    \\
-    \\EXAMPLES:
-    \\  mouser ~                         scan home directory
-    \\  mouser ~ -s --min-size 100MB     large dirs, sorted by size
-    \\  mouser ~ --filter node --delete  delete all node_modules
-    \\  mouser . -i                      interactive deletion picker
-    \\  mouser ~ --older-than 60 --json  stale dirs as JSON
-;
+fn printHelp(no_color: bool) void {
+    const w = std.fs.File.stdout().deprecatedWriter();
+    const R  = if (no_color) "" else ansi.reset;
+    const B  = if (no_color) "" else ansi.bold;
+    const Bw = if (no_color) "" else ansi.bold_white;
+    const By = if (no_color) "" else ansi.bold_yellow;
+    const Bc = if (no_color) "" else ansi.bold_cyan;
+    const Bg = if (no_color) "" else ansi.bold_green;
+    const Bm = if (no_color) "" else ansi.bold_magenta;
+    const Br = if (no_color) "" else ansi.bold_red;
+    const D  = if (no_color) "" else ansi.dim;
+
+    // ── Banner ────────────────────────────────────────────────────────────────
+    if (!no_color) {
+        w.writeAll("\n  \x1b[1;36m╔══════════════════════════════════════╗\x1b[0m\n") catch {};
+        w.writeAll("  \x1b[1;36m║\x1b[0m  \x1b[1;37m░▒▓ \x1b[1;96mMOUSER\x1b[0m\x1b[1;37m ▓▒░\x1b[0m\x1b[2m  v1.0  dependency reclaimer  \x1b[0m\x1b[1;36m║\x1b[0m\n") catch {};
+        w.writeAll("  \x1b[1;36m╚══════════════════════════════════════╝\x1b[0m\n") catch {};
+    } else {
+        w.writeAll("\n  mouser v1.0  —  dependency directory reclaimer\n") catch {};
+    }
+
+    // ── Usage ─────────────────────────────────────────────────────────────────
+    w.print("\n{s}USAGE{s}\n  mouser {s}[OPTIONS]{s} {s}[PATH]{s}\n", .{ By, R, D, R, Bw, R }) catch {};
+    w.print("  {s}PATH{s}  root directory to scan {s}(default: current dir){s}\n", .{ Bw, R, D, R }) catch {};
+
+    // ── Scan ─────────────────────────────────────────────────────────────────
+    w.print("\n{s}SCAN{s}\n", .{ By, R }) catch {};
+    const scan_rows = [_][3][]const u8{
+        .{ "-d, --depth N",       "max recursion depth",                        "" },
+        .{ "-f, --filter TYPE",   "all | python | node | rust",                 "default: all" },
+        .{ "    --target A,B,…",  "extra dir names to look for",                "" },
+        .{ "    --min-size SIZE", "skip dirs smaller than SIZE  (50MB, 1.5GiB)","" },
+        .{ "    --older-than N",  "only dirs untouched for N days",              "" },
+        .{ "    --no-size",       "skip size calculation — much faster scans",  "" },
+        .{ "-t, --threads N",     "worker threads",                             "default: cpu count" },
+    };
+    for (scan_rows) |row| {
+        w.print("  {s}{s:<26}{s}  {s}{s}{s}", .{ Bc, row[0], R, Bw, row[1], R }) catch {};
+        if (row[2].len > 0) w.print("  {s}{s}{s}", .{ D, row[2], R }) catch {};
+        w.writeAll("\n") catch {};
+    }
+
+    // ── Output ────────────────────────────────────────────────────────────────
+    w.print("\n{s}OUTPUT{s}\n", .{ By, R }) catch {};
+    const out_rows = [_][3][]const u8{
+        .{ "-s, --sort-size",  "sort results largest first",          "" },
+        .{ "    --sort-age",   "sort results oldest first",           "" },
+        .{ "    --json",       "print machine-readable JSON",         "" },
+        .{ "    --export FILE","save results to .json or .csv file",  "" },
+        .{ "    --no-color",   "disable ANSI colors and box drawing", "" },
+    };
+    for (out_rows) |row| {
+        w.print("  {s}{s:<26}{s}  {s}{s}{s}\n", .{ Bc, row[0], R, Bw, row[1], R }) catch {};
+    }
+
+    // ── Delete ────────────────────────────────────────────────────────────────
+    w.print("\n{s}DELETE{s}\n", .{ By, R }) catch {};
+    const del_rows = [_][2][]const u8{
+        .{ "    --delete",       "delete all found dirs (prompts for confirmation)" },
+        .{ "-i, --interactive",  "numbered picker — select specific dirs to delete" },
+        .{ "    --dry-run",      "show what would be deleted without touching anything" },
+    };
+    for (del_rows) |row| {
+        w.print("  {s}{s:<26}{s}  {s}{s}{s}\n", .{ Bc, row[0], R, Bw, row[1], R }) catch {};
+    }
+
+    // ── Misc ──────────────────────────────────────────────────────────────────
+    w.print("\n{s}MISC{s}\n", .{ By, R }) catch {};
+    w.print("  {s}-h, --help{s:<16}{s}  {s}show this help{s}\n", .{ Bc, R, "", Bw, R }) catch {};
+
+    // ── Detected targets ──────────────────────────────────────────────────────
+    w.print("\n{s}DETECTED TARGETS{s}\n", .{ By, R }) catch {};
+    w.print("  {s}Python{s}  {s}.venv  venv  .virtualenv  __pycache__{s}\n",  .{ By,  R, D, R }) catch {};
+    w.print("  {s}Node{s}    {s}node_modules  .next  .nuxt{s}\n",              .{ Bg,  R, D, R }) catch {};
+    w.print("  {s}Rust{s}    {s}target/{s}  {s}(only when Cargo.toml exists in parent){s}\n", .{ Br, R, D, R, D, R }) catch {};
+    w.print("  {s}Custom{s}  {s}anything added via --target{s}\n",             .{ Bm,  R, D, R }) catch {};
+
+    // ── Safety ────────────────────────────────────────────────────────────────
+    w.print("\n{s}SAFETY{s}\n", .{ By, R }) catch {};
+    w.print("  {s}Read-only by default.{s} Disk is never modified without --delete, --interactive,\n", .{ B, R }) catch {};
+    w.writeAll("  or --dry-run. Matched dirs are not recursed into (no double-counting).\n") catch {};
+    w.writeAll("  Reparse points, OneDrive stubs, and junctions are skipped automatically.\n") catch {};
+
+    // ── Examples ─────────────────────────────────────────────────────────────
+    w.print("\n{s}EXAMPLES{s}\n", .{ By, R }) catch {};
+    const examples = [_][2][]const u8{
+        .{ "mouser",                              "scan current directory" },
+        .{ "mouser ~",                            "scan home directory" },
+        .{ "mouser ~ --no-size",                  "fast scan, skip size calculation" },
+        .{ "mouser ~ -s --min-size 100MB",        "large dirs only, sorted by size" },
+        .{ "mouser ~ --filter python --sort-size","Python venvs sorted by size" },
+        .{ "mouser ~ --filter rust --older-than 30 --delete", "delete stale Rust targets" },
+        .{ "mouser . -i",                         "interactive picker — choose what to delete" },
+        .{ "mouser ~ --json | jq '.[] | .path'",  "pipe paths to jq" },
+        .{ "mouser ~ --export report.csv",        "save results to spreadsheet" },
+        .{ "mouser --target dist,build --sort-size","scan for custom dirs" },
+    };
+    for (examples) |ex| {
+        w.print("  {s}{s}{s:<50}{s}  {s}{s}{s}\n", .{ Bc, B, ex[0], R, D, ex[1], R }) catch {};
+    }
+    w.writeAll("\n") catch {};
+}
 
 fn parseArgs(alloc: Allocator) !Config {
     var config = Config{ .extra_targets = ArrayList([]const u8).init(alloc) };
@@ -1068,8 +1125,7 @@ pub fn main() !void {
     const stderr = std.fs.File.stderr().deprecatedWriter();
 
     if (config.show_help) {
-        try stdout.writeAll(help_text);
-        try stdout.writeAll("\n");
+        printHelp(config.no_color);
         return;
     }
 
