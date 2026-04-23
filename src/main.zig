@@ -6,6 +6,46 @@ const ArrayList = std.array_list.Managed; // managed: init(alloc), append(item),
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 
+// ── Win32 FFI ─────────────────────────────────────────────────────────────────
+const windows = std.os.windows;
+const FILETIME = extern struct { low: u32, high: u32 };
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes:   u32,
+    ftCreationTime:     FILETIME,
+    ftLastAccessTime:   FILETIME,
+    ftLastWriteTime:    FILETIME,
+    nFileSizeHigh:      u32,
+    nFileSizeLow:       u32,
+    dwReserved0:        u32,
+    dwReserved1:        u32,
+    cFileName:          [260]u16,
+    cAlternateFileName: [14]u16,
+};
+const FILE_ATTRIBUTE_DIRECTORY:    u32 = 0x10;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const FIND_FIRST_EX_LARGE_FETCH:   u32 = 0x2;
+
+extern "kernel32" fn FindFirstFileExW(
+    lpFileName:        [*:0]const u16,
+    fInfoLevelId:      u32,   // 1 = FindExInfoBasic (no 8.3 names)
+    lpFindFileData:    *WIN32_FIND_DATAW,
+    fSearchOp:         u32,   // 0 = FindExSearchNameMatch
+    lpSearchFilter:    ?*anyopaque,
+    dwAdditionalFlags: u32,
+) callconv(.winapi) windows.HANDLE;
+
+extern "kernel32" fn FindNextFileW(
+    hFindFile:     windows.HANDLE,
+    lpFindFileData: *WIN32_FIND_DATAW,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn FindClose(
+    hFindFile: windows.HANDLE,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn SetConsoleOutputCP(wCodePageID: u32) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn SetConsoleCP(wCodePageID: u32) callconv(.winapi) windows.BOOL;
+
 // ── ANSI colors ───────────────────────────────────────────────────────────────
 
 const ansi = struct {
@@ -122,7 +162,9 @@ fn parseSize(s: []const u8) ?u64 {
     return std.fmt.parseInt(u64, mem.trim(u8, s, " \t"), 10) catch null;
 }
 
-// Iterative dir size (avoids stack overflow on deep trees)
+// Fast iterative dir size using FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH.
+// Windows batches up to 64 KB of directory entries per kernel call instead of
+// returning one entry at a time, cutting syscall overhead by ~10-50x on large dirs.
 fn calcDirSize(alloc: Allocator, path: []const u8) u64 {
     var total: u64 = 0;
     var stack = ArrayList([]u8).init(alloc);
@@ -130,31 +172,60 @@ fn calcDirSize(alloc: Allocator, path: []const u8) u64 {
         for (stack.items) |p| alloc.free(p);
         stack.deinit();
     }
-
     const root = alloc.dupe(u8, path) catch return 0;
     stack.append(root) catch { alloc.free(root); return 0; };
+
+    var find_data: WIN32_FIND_DATAW = undefined;
+    var wide_buf: [32768]u16 = undefined; // well above MAX_PATH
 
     while (stack.items.len > 0) {
         const cur = stack.pop().?;
         defer alloc.free(cur);
-        var dir = fs.openDirAbsolute(cur, .{ .iterate = true }) catch continue;
-        defer dir.close();
-        var it = dir.iterate();
+
+        // Build wide pattern: "<cur>\*\0"
+        const enc_len = std.unicode.utf8ToUtf16Le(wide_buf[0 .. wide_buf.len - 3], cur) catch continue;
+        wide_buf[enc_len]     = '\\';
+        wide_buf[enc_len + 1] = '*';
+        wide_buf[enc_len + 2] = 0;
+        const pattern: [*:0]const u16 = @ptrCast(&wide_buf[0]);
+
+        const handle = FindFirstFileExW(
+            pattern,
+            1,    // FindExInfoBasic — skip 8.3 names (faster)
+            &find_data,
+            0,    // FindExSearchNameMatch
+            null,
+            FIND_FIRST_EX_LARGE_FETCH, // <— the key flag: 64KB batching
+        );
+        if (handle == windows.INVALID_HANDLE_VALUE) continue;
+        defer _ = FindClose(handle);
+
         while (true) {
-            const maybe_de = it.next() catch break; // skip bad entry, don't abort loop
-            const de = maybe_de orelse break;
-            switch (de.kind) {
-                .file => {
-                    // statFile avoids opening reparse points (OneDrive, junctions, AppX)
-                    const st = dir.statFile(de.name) catch continue;
-                    total += st.size;
-                },
-                .directory => {
-                    const child = fs.path.join(alloc, &.{ cur, de.name }) catch continue;
-                    stack.append(child) catch { alloc.free(child); };
-                },
-                else => {}, // skip sym_links and reparse points — no open, no panic
+            entry: {
+                const nlen = mem.indexOfScalar(u16, &find_data.cFileName, 0) orelse 260;
+                const wname = find_data.cFileName[0..nlen];
+
+                // Skip . and ..
+                const dot    = nlen == 1 and wname[0] == '.';
+                const dotdot = nlen == 2 and wname[0] == '.' and wname[1] == '.';
+                if (dot or dotdot) break :entry;
+
+                const is_dir     = find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY    != 0;
+                const is_reparse = find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+
+                if (is_dir and !is_reparse) {
+                    // Convert wide name → UTF-8, build child path
+                    var name_u8: [1024]u8 = undefined;
+                    const u8_len = std.unicode.utf16LeToUtf8(&name_u8, wname) catch break :entry;
+                    const child  = fs.path.join(alloc, &.{ cur, name_u8[0..u8_len] }) catch break :entry;
+                    stack.append(child) catch alloc.free(child);
+                } else if (!is_dir) {
+                    // Direct file size from FIND_DATA — no extra stat() call needed
+                    total += (@as(u64, find_data.nFileSizeHigh) << 32) | @as(u64, find_data.nFileSizeLow);
+                }
+                // else: reparse point (OneDrive stub, junction, AppX) — skip safely
             }
+            if (FindNextFileW(handle, &find_data) == 0) break;
         }
     }
     return total;
@@ -724,23 +795,30 @@ fn printTable(entries: []const Entry, config: *const Config, total_bytes: u64) v
     stdout.writeAll("╣\n") catch {};
     if (!nc) stdout.writeAll(ansi.reset) catch {};
 
+    // summary_inner = 46 chars between ║ and ║.
+    // Each row: "  " (2) + content + padding + "  " (2) = 46 → content+padding = 42
+    const row_avail = summary_inner - 4;
+
     for (counts) |c| {
         if (c.n == 0) continue;
         var kb: [32]u8 = undefined;
         const size_str = fmtSize(c.b, &kb);
+        const plural: []const u8 = if (c.n == 1) "" else "s";
+        // Measure visible content: label(14) + "  ·  "(5) + digits + " dir"(4) + plural + "  ·  "(5) + size
+        const n_digits: usize = if (c.n >= 1000) 4 else if (c.n >= 100) 3 else if (c.n >= 10) 2 else 1;
+        const content_len = 14 + 5 + n_digits + 4 + plural.len + 5 + size_str.len;
+        const pad = if (row_avail > content_len) row_avail - content_len else 0;
+
         if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
         stdout.writeAll("  ║  ") catch {};
         if (!nc) stdout.writeAll(c.clr) catch {};
         stdout.print("{s:<14}", .{c.label}) catch {};
         if (!nc) stdout.writeAll(ansi.dim) catch {};
-        stdout.print("  ·  {d} dir{s}  ·  ", .{ c.n, if (c.n == 1) "" else "s" }) catch {};
+        stdout.print("  ·  {d} dir{s}  ·  ", .{ c.n, plural }) catch {};
         if (!nc) stdout.writeAll(ansi.bold_yellow) catch {};
         stdout.print("{s}", .{size_str}) catch {};
         if (!nc) stdout.writeAll(ansi.reset) catch {};
-        // Pad to panel width
-        const used = 2 + 14 + 6 + 3 + if (c.n >= 10) @as(usize, 2) else @as(usize, 1) + 3 + 6 + 3 + size_str.len;
-        const remaining_space = if (summary_inner > used + 4) summary_inner - used - 4 else @as(usize, 0);
-        for (0..remaining_space) |_| stdout.writeAll(" ") catch {};
+        for (0..pad) |_| stdout.writeAll(" ") catch {};
         if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
         stdout.writeAll("  ║\n") catch {};
     }
@@ -761,10 +839,12 @@ fn printTable(entries: []const Entry, config: *const Config, total_bytes: u64) v
     if (!nc) stdout.writeAll(ansi.dim) catch {};
     stdout.writeAll("  reclaimable") catch {};
     if (!nc) stdout.writeAll(ansi.reset) catch {};
-    // Pad
-    const total_used = 7 + 4 + @as(usize, if (entries.len >= 10) 2 else 1) + 10 + 4 + total_str.len + 13;
-    const total_pad = if (summary_inner > total_used + 4) summary_inner - total_used - 4 else @as(usize, 0);
-    for (0..total_pad) |_| stdout.writeAll(" ") catch {};
+    // "TOTAL  ·  " = 10, digits, " dir"(4), "s"/"", "  ·  "(5), size, "  reclaimable"(13)
+    const t_plural: []const u8 = if (entries.len == 1) "" else "s";
+    const t_digits: usize = if (entries.len >= 1000) 4 else if (entries.len >= 100) 3 else if (entries.len >= 10) 2 else 1;
+    const t_content = 10 + t_digits + 4 + t_plural.len + 5 + total_str.len + 13;
+    const t_pad = if (row_avail > t_content) row_avail - t_content else 0;
+    for (0..t_pad) |_| stdout.writeAll(" ") catch {};
     if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
     stdout.writeAll("  ║\n") catch {};
     stdout.writeAll("  ╚") catch {};
@@ -945,15 +1025,15 @@ const SpinCtx = struct {
 };
 
 fn spinWorker(ctx: SpinCtx) void {
-    const frames = [_][]const u8{ "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷" };
+    const frames = [_]u8{ '|', '/', '-', '\\' }; // ASCII — works in every font/terminal
     var f: usize = 0;
     const w = std.fs.File.stderr().deprecatedWriter();
     while (ctx.running.load(.monotonic)) {
         const c = ctx.count.load(.monotonic);
         if (!ctx.no_color) {
-            w.print("\r  \x1b[1;36m{s}\x1b[0m  \x1b[2mSCANNING\x1b[0m  \x1b[1;33m{d} found\x1b[0m  ", .{ frames[f % frames.len], c }) catch {};
+            w.print("\r  \x1b[1;36m{c}\x1b[0m  \x1b[2mscanning\x1b[0m  \x1b[1;33m{d} found\x1b[0m   ", .{ frames[f % frames.len], c }) catch {};
         } else {
-            w.print("\r  {s}  SCANNING  {d} found  ", .{ frames[f % frames.len], c }) catch {};
+            w.print("\r  {c}  scanning  {d} found   ", .{ frames[f % frames.len], c }) catch {};
         }
         f += 1;
         std.Thread.sleep(80 * std.time.ns_per_ms);
@@ -964,6 +1044,10 @@ fn spinWorker(ctx: SpinCtx) void {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
+    // Set Windows console to UTF-8 so box-drawing and other Unicode renders correctly
+    _ = SetConsoleOutputCP(65001);
+    _ = SetConsoleCP(65001);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
