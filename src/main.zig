@@ -259,6 +259,7 @@ const Config = struct {
     no_color: bool = false,
     no_size: bool = false,
     num_threads: usize = 0, // 0 = auto (cpu count)
+    no_cache: bool = false,
     show_help: bool = false,
 };
 
@@ -424,6 +425,8 @@ fn parseArgs(alloc: Allocator) !Config {
                 const trimmed = mem.trim(u8, t, " \t");
                 if (trimmed.len > 0) try config.extra_targets.append(try alloc.dupe(u8, trimmed));
             }
+        } else if (mem.eql(u8, arg, "--no-cache")) {
+            config.no_cache = true;
         }
     }
     return config;
@@ -579,16 +582,22 @@ fn processItem(shared: *ScanShared, item: ScanItem) void {
     if (!matched) {
         for (shared.config.extra_targets.items) |ct| {
             if (mem.eql(u8, name, ct)) {
-                const path_copy = shared.alloc.dupe(u8, item.path) catch return;
+                const path_copy  = shared.alloc.dupe(u8, item.path) catch return;
+                const label_copy = shared.alloc.dupe(u8, ct) catch { shared.alloc.free(path_copy); return; };
                 const ent = Entry{
                     .path = path_copy,
                     .kind = .custom,
-                    .custom_label = ct,
+                    .custom_label = label_copy, // owned — freed in entries cleanup
                     .size_bytes = 0,
                     .mtime_ns = getDirMtime(item.path),
                 };
                 shared.entries_mu.lock();
-                shared.entries.append(ent) catch { shared.alloc.free(path_copy); shared.entries_mu.unlock(); return; };
+                shared.entries.append(ent) catch {
+                    shared.alloc.free(path_copy);
+                    shared.alloc.free(label_copy);
+                    shared.entries_mu.unlock();
+                    return;
+                };
                 shared.entries_mu.unlock();
                 _ = shared.found_count.fetchAdd(1, .monotonic);
                 matched = true;
@@ -1020,60 +1029,264 @@ fn interactiveSelect(alloc: Allocator, entries: []const Entry, no_color: bool) !
     if (!no_color) stdout.writeAll(ansi.reset) catch {};
 
     if (!no_color) stdout.writeAll(ansi.dim) catch {};
-    stdout.writeAll("  enter: 1,3  │  2-5  │  all  │  blank=cancel\n") catch {};
-    if (!no_color) stdout.writeAll(ansi.reset ++ ansi.bold_cyan) catch {};
-    stdout.writeAll("  ❯ ") catch {};
+    stdout.writeAll("  enter: 1,3  |  2-5  |  all  |  blank=cancel\n") catch {};
     if (!no_color) stdout.writeAll(ansi.reset) catch {};
 
     var line_buf: [1024]u8 = undefined;
-    const raw = try stdin.readUntilDelimiterOrEof(&line_buf, '\n') orelse return selected;
-    const input = mem.trim(u8, raw, " \t\r\n");
-    if (input.len == 0) return selected;
-
     var chosen = ArrayList(usize).init(alloc);
     defer chosen.deinit();
 
-    if (std.ascii.eqlIgnoreCase(input, "all")) {
-        for (0..entries.len) |i| try chosen.append(i);
-    } else {
-        var parts = mem.splitScalar(u8, input, ',');
-        while (parts.next()) |part| {
-            const p = mem.trim(u8, part, " \t");
-            if (mem.indexOfScalar(u8, p, '-')) |dash| {
-                const a = std.fmt.parseInt(usize, p[0..dash], 10) catch continue;
-                const b = std.fmt.parseInt(usize, p[dash + 1 ..], 10) catch continue;
-                var k = a;
-                while (k <= b) : (k += 1) if (k >= 1 and k <= entries.len) try chosen.append(k - 1);
+    // ── Selection retry loop ──────────────────────────────────────────────────
+    selection: while (true) {
+        if (!no_color) stdout.writeAll(ansi.bold_cyan) catch {};
+        stdout.writeAll("  ❯ ") catch {};
+        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+
+        const raw = (try stdin.readUntilDelimiterOrEof(&line_buf, '\n')) orelse return selected;
+        const input = mem.trim(u8, raw, " \t\r\n");
+
+        if (input.len == 0) return selected; // blank = cancel
+
+        chosen.clearRetainingCapacity();
+
+        if (std.ascii.eqlIgnoreCase(input, "all")) {
+            for (0..entries.len) |i| try chosen.append(i);
+        } else {
+            var parts = mem.splitScalar(u8, input, ',');
+            while (parts.next()) |part| {
+                const p = mem.trim(u8, part, " \t");
+                if (p.len == 0) continue;
+                if (mem.indexOfScalar(u8, p, '-')) |dash| {
+                    const a = std.fmt.parseInt(usize, p[0..dash], 10) catch {
+                        if (!no_color) stdout.writeAll(ansi.red) catch {};
+                        stdout.print("  ! '{s}' is not a valid number — try again (blank=cancel):\n", .{p}) catch {};
+                        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+                        continue :selection;
+                    };
+                    const b = std.fmt.parseInt(usize, p[dash + 1 ..], 10) catch {
+                        if (!no_color) stdout.writeAll(ansi.red) catch {};
+                        stdout.print("  ! '{s}' is not a valid range — try again (blank=cancel):\n", .{p}) catch {};
+                        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+                        continue :selection;
+                    };
+                    if (a < 1 or b > entries.len or a > b) {
+                        if (!no_color) stdout.writeAll(ansi.red) catch {};
+                        stdout.print("  ! Range {d}-{d} is out of bounds (1-{d}) — try again:\n",
+                            .{ a, b, entries.len }) catch {};
+                        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+                        continue :selection;
+                    }
+                    var k = a;
+                    while (k <= b) : (k += 1) try chosen.append(k - 1);
+                } else {
+                    const n = std.fmt.parseInt(usize, p, 10) catch {
+                        if (!no_color) stdout.writeAll(ansi.red) catch {};
+                        stdout.print("  ! '{s}' is not a number — try again (blank=cancel):\n", .{p}) catch {};
+                        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+                        continue :selection;
+                    };
+                    if (n < 1 or n > entries.len) {
+                        if (!no_color) stdout.writeAll(ansi.red) catch {};
+                        stdout.print("  ! {d} is out of range (1-{d}) — try again:\n",
+                            .{ n, entries.len }) catch {};
+                        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+                        continue :selection;
+                    }
+                    try chosen.append(n - 1);
+                }
+            }
+        }
+
+        if (chosen.items.len == 0) {
+            if (!no_color) stdout.writeAll(ansi.red) catch {};
+            stdout.writeAll("  ! Nothing selected — try again (blank=cancel):\n") catch {};
+            if (!no_color) stdout.writeAll(ansi.reset) catch {};
+            continue :selection;
+        }
+
+        // ── Confirmation loop ─────────────────────────────────────────────────
+        while (true) {
+            var preview_total: u64 = 0;
+            stdout.writeAll("\n  Selected for deletion:\n") catch {};
+            for (chosen.items) |idx| {
+                var sb: [32]u8 = undefined;
+                if (!no_color) stdout.writeAll(ansi.dim) catch {};
+                stdout.print("    • [{s}]  {s}{s}\n",
+                    .{ entries[idx].sizeStr(&sb), entries[idx].path,
+                       if (no_color) "" else ansi.reset }) catch {};
+                preview_total += entries[idx].size_bytes;
+            }
+            var pb: [32]u8 = undefined;
+            if (!no_color) stdout.writeAll(ansi.bold_white) catch {};
+            stdout.print("  Total: {s}{s}\n", .{ fmtSize(preview_total, &pb), if (no_color) "" else ansi.reset }) catch {};
+            if (!no_color) stdout.writeAll(ansi.bold_cyan) catch {};
+            stdout.writeAll("  Confirm delete? (y/N/back): ") catch {};
+            if (!no_color) stdout.writeAll(ansi.reset) catch {};
+
+            var cbuf: [16]u8 = undefined;
+            const craw = (try stdin.readUntilDelimiterOrEof(&cbuf, '\n')) orelse return selected;
+            const confirm_in = mem.trim(u8, craw, " \t\r\n");
+
+            if (std.ascii.eqlIgnoreCase(confirm_in, "y") or
+                std.ascii.eqlIgnoreCase(confirm_in, "yes"))
+            {
+                for (chosen.items) |idx| try selected.append(entries[idx].path);
+                return selected;
+            } else if (std.ascii.eqlIgnoreCase(confirm_in, "back") or
+                       std.ascii.eqlIgnoreCase(confirm_in, "b"))
+            {
+                stdout.writeAll("\n  Back to selection:\n") catch {};
+                continue :selection;
             } else {
-                const n = std.fmt.parseInt(usize, p, 10) catch continue;
-                if (n >= 1 and n <= entries.len) try chosen.append(n - 1);
+                // "n", blank, anything else
+                if (!no_color) stdout.writeAll(ansi.dim) catch {};
+                stdout.writeAll("  Cancelled.  Re-select? (y/N): ") catch {};
+                if (!no_color) stdout.writeAll(ansi.reset) catch {};
+                var rbuf: [8]u8 = undefined;
+                const rraw = (try stdin.readUntilDelimiterOrEof(&rbuf, '\n')) orelse return selected;
+                const retry_in = mem.trim(u8, rraw, " \t\r\n");
+                if (std.ascii.eqlIgnoreCase(retry_in, "y") or
+                    std.ascii.eqlIgnoreCase(retry_in, "yes"))
+                {
+                    stdout.writeAll("\n") catch {};
+                    continue :selection;
+                }
+                return selected;
             }
         }
     }
-
-    if (chosen.items.len == 0) return selected;
-
-    var preview_total: u64 = 0;
-    stdout.writeAll("\n  Selected for deletion:\n") catch {};
-    for (chosen.items) |idx| {
-        var sb: [32]u8 = undefined;
-        stdout.print("    • [{s}] {s}\n", .{ entries[idx].sizeStr(&sb), entries[idx].path }) catch {};
-        preview_total += entries[idx].size_bytes;
-    }
-    var pb: [32]u8 = undefined;
-    stdout.print("  Total: {s}\n  Confirm? (y/N): ", .{fmtSize(preview_total, &pb)}) catch {};
-
-    var cbuf: [8]u8 = undefined;
-    const craw = try stdin.readUntilDelimiterOrEof(&cbuf, '\n') orelse return selected;
-    const confirm = mem.trim(u8, craw, " \t\r\n");
-    if (!std.ascii.eqlIgnoreCase(confirm, "y") and !std.ascii.eqlIgnoreCase(confirm, "yes"))
-        return selected;
-
-    for (chosen.items) |idx| try selected.append(entries[idx].path);
-    return selected;
 }
 
 // ── Spinner thread ────────────────────────────────────────────────────────────
+
+// ── Result cache ─────────────────────────────────────────────────────────────
+// Writes the most recent scan to %TEMP%\mouser-cache.tmp so a follow-up run
+// on the same path can reuse the results instead of re-scanning.
+// TTL: 30 minutes.  Format: line-based TSV, easy to parse without a JSON lib.
+
+const CACHE_TTL_SECS: i64 = 30 * 60;
+
+fn getCachePath(alloc: Allocator) ?[]u8 {
+    const tmp = std.process.getEnvVarOwned(alloc, "TEMP") catch
+                std.process.getEnvVarOwned(alloc, "TMP")  catch
+                return null;
+    defer alloc.free(tmp);
+    return fs.path.join(alloc, &.{ tmp, "mouser-cache.tmp" }) catch null;
+}
+
+fn saveCache(alloc: Allocator, root: []const u8, config: *const Config, entries: []const Entry) void {
+    const cache_path = getCachePath(alloc) orelse return;
+    defer alloc.free(cache_path);
+
+    const file = fs.createFileAbsolute(cache_path, .{ .truncate = true }) catch return;
+    defer file.close();
+    const w = file.deprecatedWriter();
+
+    const now: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_s));
+    const depth_val: i64 = if (config.depth) |d| @intCast(d) else -1;
+
+    w.print("MOUSER_V1\n{s}\n{d}\n{s}\n{d}\n{d}\n{d}\n",
+        .{ root, now, @tagName(config.filter), depth_val,
+           @intFromBool(config.no_size), entries.len }) catch return;
+
+    for (entries) |*e| {
+        // custom_label may contain anything except \t and \n — safe for TSV
+        w.print("{s}\t{s}\t{s}\t{d}\t{d}\n",
+            .{ e.path, @tagName(e.kind), e.custom_label, e.size_bytes, e.mtime_ns }) catch return;
+    }
+}
+
+const CacheResult = struct { entries: ArrayList(Entry), age_secs: u64 };
+
+fn loadCache(alloc: Allocator, root: []const u8, config: *const Config) ?CacheResult {
+    if (config.no_cache) return null;
+
+    const cache_path = getCachePath(alloc) orelse return null;
+    defer alloc.free(cache_path);
+
+    const file = fs.openFileAbsolute(cache_path, .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(alloc, 32 * 1024 * 1024) catch return null;
+    defer alloc.free(content);
+
+    var lines = mem.splitScalar(u8, content, '\n');
+
+    // Header
+    const hdr = mem.trim(u8, lines.next() orelse return null, "\r");
+    if (!mem.eql(u8, hdr, "MOUSER_V1")) return null;
+
+    const cached_root   = mem.trim(u8, lines.next() orelse return null, "\r");
+    const ts_s          = mem.trim(u8, lines.next() orelse return null, "\r");
+    const cached_filter = mem.trim(u8, lines.next() orelse return null, "\r");
+    const depth_s       = mem.trim(u8, lines.next() orelse return null, "\r");
+    const nosize_s      = mem.trim(u8, lines.next() orelse return null, "\r");
+    const count_s       = mem.trim(u8, lines.next() orelse return null, "\r");
+
+    const cached_ts    = std.fmt.parseInt(i64, ts_s, 10)     catch return null;
+    const cached_depth = std.fmt.parseInt(i64, depth_s, 10)  catch return null;
+    const cached_nosize = std.fmt.parseInt(u8, nosize_s, 10) catch return null;
+    const entry_count  = std.fmt.parseInt(usize, count_s, 10) catch return null;
+
+    // Validate staleness and config match
+    const now: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_s));
+    const age = now - cached_ts;
+    if (age < 0 or age > CACHE_TTL_SECS) return null;
+    if (!mem.eql(u8, cached_root, root)) return null;
+    if (!mem.eql(u8, cached_filter, @tagName(config.filter))) return null;
+    const cfg_depth: i64 = if (config.depth) |d| @intCast(d) else -1;
+    if (cached_depth != cfg_depth) return null;
+    // If cached without sizes but user wants sizes → rescan
+    if (cached_nosize == 1 and !config.no_size) return null;
+
+    // Parse entry lines
+    var entries = ArrayList(Entry).init(alloc);
+    errdefer { for (entries.items) |*e| alloc.free(e.path); entries.deinit(); }
+
+    var parsed: usize = 0;
+    while (lines.next()) |line| {
+        if (parsed >= entry_count) break;
+        const l = mem.trim(u8, line, "\r\n");
+        if (l.len == 0) continue;
+
+        // Fields: path \t kind \t custom_label \t size_bytes \t mtime_ns
+        var f = mem.splitScalar(u8, l, '\t');
+        const path_s   = f.next() orelse continue;
+        const kind_s   = f.next() orelse continue;
+        const label_s  = f.next() orelse continue;
+        const size_s   = f.next() orelse continue;
+        const mtime_s  = f.next() orelse continue;
+
+        const kind  = std.meta.stringToEnum(DirKind, kind_s) orelse continue;
+        const sz    = std.fmt.parseInt(u64, size_s, 10)    catch continue;
+        const mt    = std.fmt.parseInt(i128, mtime_s, 10)  catch continue;
+        const path_owned = alloc.dupe(u8, path_s)          catch continue;
+
+        entries.append(.{
+            .path         = path_owned,
+            .kind         = kind,
+            .custom_label = label_s, // points into alloc'd `content` — but content is freed!
+            .size_bytes   = sz,
+            .mtime_ns     = mt,
+        }) catch { alloc.free(path_owned); continue; };
+        parsed += 1;
+    }
+
+    if (parsed == 0 and entry_count > 0) {
+        for (entries.items) |*e| alloc.free(e.path);
+        entries.deinit();
+        return null;
+    }
+
+    // custom_label points into freed `content` — dupe all custom labels now
+    for (entries.items) |*e| {
+        if (e.kind == .custom) {
+            e.custom_label = alloc.dupe(u8, e.custom_label) catch "";
+        }
+    }
+
+    return CacheResult{ .entries = entries, .age_secs = @intCast(age) };
+}
 
 const SpinCtx = struct {
     running:  *std.atomic.Value(bool),
@@ -1160,71 +1373,102 @@ pub fn main() !void {
         try stdout.writeAll("  ║  MOUSER v1.0  dependency reclaimer  ║\n");
         try stdout.writeAll("  ╚══════════════════════════════════════╝\n\n");
     }
+    // ── Try cache first ───────────────────────────────────────────────────────
+    var from_cache = false;
+    var cache_age_secs: u64 = 0;
+
+    var entries = ArrayList(Entry).init(alloc);
+    defer {
+        for (entries.items) |*e| {
+            alloc.free(e.path);
+            if (e.kind == .custom) alloc.free(e.custom_label);
+        }
+        entries.deinit();
+    }
+
+    if (loadCache(alloc, root_abs, &config)) |cr| {
+        entries = cr.entries;
+        from_cache = true;
+        cache_age_secs = cr.age_secs;
+    }
+
+    // ── Print scan header ─────────────────────────────────────────────────────
+    if (!config.no_color) try stdout.writeAll(ansi.dim);
     try stdout.print("  scanning  {s}", .{root_abs});
     if (!config.no_color) try stdout.writeAll(ansi.reset);
     if (config.depth) |d| try stdout.print("  depth≤{d}", .{d});
     if (config.filter != .all) try stdout.print("  filter:{s}", .{@tagName(config.filter)});
     if (config.no_size) try stdout.writeAll("  no-size");
-    try stdout.print("  threads:{d}", .{config.num_threads});
+    if (from_cache) {
+        const age_min = cache_age_secs / 60;
+        const age_sec = cache_age_secs % 60;
+        if (!config.no_color) try stdout.writeAll(ansi.bold_yellow);
+        if (age_min > 0) {
+            try stdout.print("  [cached {d}m{d}s ago — --no-cache to rescan]", .{ age_min, age_sec });
+        } else {
+            try stdout.print("  [cached {d}s ago — --no-cache to rescan]", .{age_sec});
+        }
+        if (!config.no_color) try stdout.writeAll(ansi.reset);
+    } else {
+        try stdout.print("  threads:{d}", .{config.num_threads});
+    }
     try stdout.writeAll("\n\n");
 
-    // Scan — parallel work-stealing scanner
-    var entries = ArrayList(Entry).init(alloc);
-    defer {
-        for (entries.items) |*e| alloc.free(e.path);
-        entries.deinit();
-    }
+    // ── Full scan (cache miss) ────────────────────────────────────────────────
+    if (!from_cache) {
+        var entries_mu = Mutex{};
+        var found_count = std.atomic.Value(u64).init(0);
+        const t0 = std.time.milliTimestamp();
 
-    var entries_mu = Mutex{};
-    var found_count = std.atomic.Value(u64).init(0);
-    const t0 = std.time.milliTimestamp();
+        var spin_running = std.atomic.Value(bool).init(true);
+        const spin_thread = try Thread.spawn(.{}, spinWorker, .{SpinCtx{
+            .running  = &spin_running,
+            .count    = &found_count,
+            .no_color = config.no_color,
+        }});
 
-    var spin_running = std.atomic.Value(bool).init(true);
-    const spin_thread = try Thread.spawn(.{}, spinWorker, .{SpinCtx{
-        .running  = &spin_running,
-        .count    = &found_count,
-        .no_color = config.no_color,
-    }});
+        {
+            const root_copy = try alloc.dupe(u8, root_abs);
+            var shared = ScanShared{
+                .alloc       = alloc,
+                .queue       = ArrayList(ScanItem).init(alloc),
+                .queue_mu    = Mutex{},
+                .entries     = &entries,
+                .entries_mu  = &entries_mu,
+                .config      = &config,
+                .found_count = &found_count,
+                .remaining   = std.atomic.Value(i64).init(1),
+            };
+            defer {
+                for (shared.queue.items) |item| alloc.free(item.path);
+                shared.queue.deinit();
+            }
+            try shared.queue.append(.{ .path = root_copy, .depth = 0 });
 
-    {
-        // Root item starts with remaining=1
-        const root_copy = try alloc.dupe(u8, root_abs);
-        var shared = ScanShared{
-            .alloc       = alloc,
-            .queue       = ArrayList(ScanItem).init(alloc),
-            .queue_mu    = Mutex{},
-            .entries     = &entries,
-            .entries_mu  = &entries_mu,
-            .config      = &config,
-            .found_count = &found_count,
-            .remaining   = std.atomic.Value(i64).init(1),
-        };
-        defer {
-            for (shared.queue.items) |item| alloc.free(item.path);
-            shared.queue.deinit();
+            const n_scan = config.num_threads;
+            const scan_threads = try alloc.alloc(Thread, n_scan);
+            defer alloc.free(scan_threads);
+            for (0..n_scan) |i| {
+                scan_threads[i] = try Thread.spawn(.{}, scanWorker, .{&shared});
+            }
+            for (scan_threads) |t| t.join();
         }
-        try shared.queue.append(.{ .path = root_copy, .depth = 0 });
 
-        const n_scan = config.num_threads;
-        const scan_threads = try alloc.alloc(Thread, n_scan);
-        defer alloc.free(scan_threads);
-        for (0..n_scan) |i| {
-            scan_threads[i] = try Thread.spawn(.{}, scanWorker, .{&shared});
+        spin_running.store(false, .monotonic);
+        spin_thread.join();
+
+        const scan_ms = std.time.milliTimestamp() - t0;
+        try stderr.print("  Scan: {d} dirs, {d}ms\n", .{ entries.items.len, scan_ms });
+
+        // Parallel size calculation
+        if (!config.no_size and entries.items.len > 0) {
+            const t1 = std.time.milliTimestamp();
+            try calcSizesParallel(alloc, entries.items, config.num_threads);
+            try stderr.print("  Sizes: {d}ms\n", .{std.time.milliTimestamp() - t1});
         }
-        for (scan_threads) |t| t.join();
-    }
 
-    spin_running.store(false, .monotonic);
-    spin_thread.join();
-
-    const scan_ms = std.time.milliTimestamp() - t0;
-    try stderr.print("  Scan: {d} dirs, {d}ms\n", .{ entries.items.len, scan_ms });
-
-    // Parallel size calculation
-    if (!config.no_size and entries.items.len > 0) {
-        const t1 = std.time.milliTimestamp();
-        try calcSizesParallel(alloc, entries.items, config.num_threads);
-        try stderr.print("  Sizes: {d}ms\n", .{std.time.milliTimestamp() - t1});
+        // Save results to cache for next run
+        saveCache(alloc, root_abs, &config, entries.items);
     }
 
     // Apply post-filters
