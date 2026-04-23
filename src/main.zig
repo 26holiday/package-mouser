@@ -9,19 +9,25 @@ const Mutex = Thread.Mutex;
 // ── ANSI colors ───────────────────────────────────────────────────────────────
 
 const ansi = struct {
-    const reset = "\x1b[0m";
-    const bold = "\x1b[1m";
-    const dim = "\x1b[2m";
-    const red = "\x1b[31m";
-    const green = "\x1b[32m";
-    const yellow = "\x1b[33m";
-    const blue = "\x1b[34m";
-    const cyan = "\x1b[36m";
-    const bold_red = "\x1b[1;31m";
-    const bold_yellow = "\x1b[1;33m";
-    const bold_cyan = "\x1b[1;36m";
-    const bold_green = "\x1b[1;32m";
-    const bold_white = "\x1b[1;37m";
+    const reset        = "\x1b[0m";
+    const bold         = "\x1b[1m";
+    const dim          = "\x1b[2m";
+    const underline    = "\x1b[4m";
+    const red          = "\x1b[31m";
+    const green        = "\x1b[32m";
+    const yellow       = "\x1b[33m";
+    const blue         = "\x1b[34m";
+    const magenta      = "\x1b[35m";
+    const cyan         = "\x1b[36m";
+    const bold_red     = "\x1b[1;31m";
+    const bold_yellow  = "\x1b[1;33m";
+    const bold_cyan    = "\x1b[1;36m";
+    const bold_green   = "\x1b[1;32m";
+    const bold_white   = "\x1b[1;37m";
+    const bold_magenta = "\x1b[1;35m";
+    const bright_cyan  = "\x1b[96m";
+    const bright_green = "\x1b[92m";
+    const bright_red   = "\x1b[91m";
 };
 
 // ── DirKind ───────────────────────────────────────────────────────────────────
@@ -181,7 +187,7 @@ const Config = struct {
     extra_targets: ArrayList([]const u8),
     no_color: bool = false,
     no_size: bool = false,
-    num_threads: usize = 4,
+    num_threads: usize = 0, // 0 = auto (cpu count)
     show_help: bool = false,
 };
 
@@ -233,6 +239,8 @@ const help_text =
 
 fn parseArgs(alloc: Allocator) !Config {
     var config = Config{ .extra_targets = ArrayList([]const u8).init(alloc) };
+    // Always heap-allocate root so main can unconditionally free it
+    config.root = try alloc.dupe(u8, ".");
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
@@ -240,7 +248,8 @@ fn parseArgs(alloc: Allocator) !Config {
     var got_path = false;
     while (args.next()) |arg| {
         if (!got_path and arg.len > 0 and arg[0] != '-') {
-            config.root = arg;
+            alloc.free(config.root); // free the default "." dupe before overwriting
+            config.root = try alloc.dupe(u8, arg);
             got_path = true;
             continue;
         }
@@ -275,7 +284,8 @@ fn parseArgs(alloc: Allocator) !Config {
             const v = args.next() orelse return error.MissingValue;
             config.older_than = try std.fmt.parseInt(u64, v, 10);
         } else if (mem.eql(u8, arg, "--export")) {
-            config.export_path = args.next() orelse return error.MissingValue;
+            const v = args.next() orelse return error.MissingValue;
+            config.export_path = try alloc.dupe(u8, v);
         } else if (mem.eql(u8, arg, "-t") or mem.eql(u8, arg, "--threads")) {
             const v = args.next() orelse return error.MissingValue;
             config.num_threads = try std.fmt.parseInt(usize, v, 10);
@@ -284,7 +294,7 @@ fn parseArgs(alloc: Allocator) !Config {
             var it = mem.splitScalar(u8, v, ',');
             while (it.next()) |t| {
                 const trimmed = mem.trim(u8, t, " \t");
-                if (trimmed.len > 0) try config.extra_targets.append(trimmed);
+                if (trimmed.len > 0) try config.extra_targets.append(try alloc.dupe(u8, trimmed));
             }
         }
     }
@@ -295,10 +305,19 @@ fn parseArgs(alloc: Allocator) !Config {
 
 const skip_names = [_][]const u8{
     "System Volume Information", "$RECYCLE.BIN",
-    "Windows",                   "Program Files",
-    "Program Files (x86)",       "ProgramData",
-    "AppData",                   "__pycache__",
-    ".git",
+    "Windows",      "Program Files", "Program Files (x86)", "ProgramData",
+    "AppData",      "__pycache__",   ".git",
+    // Windows package/app stores — massive subtrees, no dependency dirs inside
+    "Packages",     "WinGet",        "WindowsApps",
+    "WinSxS",       "MicrosoftEdgeBackups",
+};
+
+// Extra path-suffix guards for when scan root IS inside AppData or reached via junction
+const skip_path_suffixes = [_][]const u8{
+    "\\AppData\\Local\\Packages",
+    "\\AppData\\Local\\Microsoft\\WinGet",
+    "\\AppData\\Local\\Microsoft\\WindowsApps",
+    "\\AppData\\Roaming\\Microsoft",
 };
 
 fn shouldSkip(name: []const u8) bool {
@@ -328,126 +347,166 @@ fn kindMatchesFilter(kind: DirKind, filter: FilterType) bool {
 
 const ScanItem = struct { path: []u8, depth: usize };
 
-fn scanRoot(
-    alloc: Allocator,
-    root_abs: []const u8,
-    config: *const Config,
-    entries: *ArrayList(Entry),
-    mu: *Mutex,
+// Shared state for parallel scanner workers
+const ScanShared = struct {
+    alloc:       Allocator,
+    queue:       ArrayList(ScanItem),
+    queue_mu:    Mutex,
+    entries:     *ArrayList(Entry),
+    entries_mu:  *Mutex,
+    config:      *const Config,
     found_count: *std.atomic.Value(u64),
-) !void {
-    var stack = ArrayList(ScanItem).init(alloc);
-    defer {
-        for (stack.items) |item| alloc.free(item.path);
-        stack.deinit();
-    }
+    // remaining = items currently in queue + items being actively processed
+    // workers exit when remaining hits 0 (nothing left to do)
+    remaining:   std.atomic.Value(i64),
+};
 
-    const root_copy = try alloc.dupe(u8, root_abs);
-    try stack.append(.{ .path = root_copy, .depth = 0 });
+fn scanWorker(shared: *ScanShared) void {
+    while (true) {
+        // Grab one item from the shared queue
+        shared.queue_mu.lock();
+        const item_opt: ?ScanItem = if (shared.queue.items.len > 0) shared.queue.pop().? else null;
+        shared.queue_mu.unlock();
 
-    while (stack.items.len > 0) {
-        const item = stack.pop().?;
-        defer alloc.free(item.path);
-
-        if (config.depth) |max_d| if (item.depth > max_d) continue;
-
-        const name = fs.path.basename(item.path);
-        if (name.len == 0 or shouldSkip(name)) continue;
-
-        var matched = false;
-
-        // Check builtin targets
-        for (builtin_targets) |t| {
-            if (mem.eql(u8, name, t.name) and kindMatchesFilter(t.kind, config.filter)) {
-                const ent = Entry{
-                    .path = try alloc.dupe(u8, item.path),
-                    .kind = t.kind,
-                    .custom_label = "",
-                    .size_bytes = 0,
-                    .mtime_ns = getDirMtime(item.path),
-                };
-                mu.lock();
-                try entries.append(ent);
-                mu.unlock();
-                _ = found_count.fetchAdd(1, .monotonic);
-                matched = true;
-                break;
-            }
+        if (item_opt == null) {
+            // Queue empty — check if any other thread still has work
+            if (shared.remaining.load(.seq_cst) <= 0) return;
+            std.Thread.yield() catch {};
+            continue;
         }
 
-        // Rust target/ detection
-        if (!matched and mem.eql(u8, name, "target") and
-            (config.filter == .all or config.filter == .rust))
-        {
-            const parent = fs.path.dirname(item.path) orelse "";
-            if (parent.len > 0) {
-                const cargo_path = try fs.path.join(alloc, &.{ parent, "Cargo.toml" });
-                defer alloc.free(cargo_path);
-                if (fs.accessAbsolute(cargo_path, .{})) |_| {
+        const item = item_opt.?;
+        defer shared.alloc.free(item.path);
+
+        // Process item (match logic same as old scanRoot)
+        processItem(shared, item);
+
+        // Done with this item — decrement remaining
+        _ = shared.remaining.fetchSub(1, .seq_cst);
+    }
+}
+
+fn processItem(shared: *ScanShared, item: ScanItem) void {
+    if (shared.config.depth) |max_d| if (item.depth > max_d) return;
+
+    const name = fs.path.basename(item.path);
+    if (name.len == 0 or shouldSkip(name)) return;
+
+    // Path-suffix guard for Windows package stores reached via junction
+    for (skip_path_suffixes) |sfx| {
+        if (mem.endsWith(u8, item.path, sfx)) return;
+    }
+
+    var matched = false;
+
+    // Check builtin targets
+    for (builtin_targets) |t| {
+        if (mem.eql(u8, name, t.name) and kindMatchesFilter(t.kind, shared.config.filter)) {
+            const path_copy = shared.alloc.dupe(u8, item.path) catch return;
+            const ent = Entry{
+                .path = path_copy,
+                .kind = t.kind,
+                .custom_label = "",
+                .size_bytes = 0,
+                .mtime_ns = getDirMtime(item.path),
+            };
+            shared.entries_mu.lock();
+            shared.entries.append(ent) catch { shared.alloc.free(path_copy); shared.entries_mu.unlock(); return; };
+            shared.entries_mu.unlock();
+            _ = shared.found_count.fetchAdd(1, .monotonic);
+            matched = true;
+            break;
+        }
+    }
+
+    // Rust target/ detection
+    if (!matched and mem.eql(u8, name, "target") and
+        (shared.config.filter == .all or shared.config.filter == .rust))
+    {
+        const parent = fs.path.dirname(item.path) orelse "";
+        if (parent.len > 0) {
+            const cargo_path = fs.path.join(shared.alloc, &.{ parent, "Cargo.toml" }) catch null;
+            if (cargo_path) |cp| {
+                defer shared.alloc.free(cp);
+                if (fs.accessAbsolute(cp, .{})) |_| {
+                    const path_copy = shared.alloc.dupe(u8, item.path) catch return;
                     const ent = Entry{
-                        .path = try alloc.dupe(u8, item.path),
+                        .path = path_copy,
                         .kind = .rust_target,
                         .custom_label = "",
                         .size_bytes = 0,
                         .mtime_ns = getDirMtime(item.path),
                     };
-                    mu.lock();
-                    try entries.append(ent);
-                    mu.unlock();
-                    _ = found_count.fetchAdd(1, .monotonic);
+                    shared.entries_mu.lock();
+                    shared.entries.append(ent) catch { shared.alloc.free(path_copy); shared.entries_mu.unlock(); return; };
+                    shared.entries_mu.unlock();
+                    _ = shared.found_count.fetchAdd(1, .monotonic);
                     matched = true;
                 } else |_| {}
             }
         }
+    }
 
-        // Custom targets
-        if (!matched) {
-            for (config.extra_targets.items) |ct| {
-                if (mem.eql(u8, name, ct)) {
-                    const ent = Entry{
-                        .path = try alloc.dupe(u8, item.path),
-                        .kind = .custom,
-                        .custom_label = ct,
-                        .size_bytes = 0,
-                        .mtime_ns = getDirMtime(item.path),
-                    };
-                    mu.lock();
-                    try entries.append(ent);
-                    mu.unlock();
-                    _ = found_count.fetchAdd(1, .monotonic);
-                    matched = true;
-                    break;
-                }
+    // Custom targets
+    if (!matched) {
+        for (shared.config.extra_targets.items) |ct| {
+            if (mem.eql(u8, name, ct)) {
+                const path_copy = shared.alloc.dupe(u8, item.path) catch return;
+                const ent = Entry{
+                    .path = path_copy,
+                    .kind = .custom,
+                    .custom_label = ct,
+                    .size_bytes = 0,
+                    .mtime_ns = getDirMtime(item.path),
+                };
+                shared.entries_mu.lock();
+                shared.entries.append(ent) catch { shared.alloc.free(path_copy); shared.entries_mu.unlock(); return; };
+                shared.entries_mu.unlock();
+                _ = shared.found_count.fetchAdd(1, .monotonic);
+                matched = true;
+                break;
             }
         }
+    }
 
-        if (matched) continue;
+    if (matched) return;
 
-        // Recurse into subdirs
-        var dir = fs.openDirAbsolute(item.path, .{ .iterate = true }) catch continue;
-        defer dir.close();
-        var it = dir.iterate();
-        while (it.next() catch null) |de| {
-            if (de.kind != .directory) continue;
-            const child = try fs.path.join(alloc, &.{ item.path, de.name });
-            stack.append(.{ .path = child, .depth = item.depth + 1 }) catch { alloc.free(child); };
-        }
+    // Recurse into subdirs — push children BEFORE decrementing remaining
+    var dir = fs.openDirAbsolute(item.path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var it = dir.iterate();
+    while (true) {
+        const maybe_de = it.next() catch break;
+        const de = maybe_de orelse break;
+        if (de.kind != .directory) continue;
+        const child_path = fs.path.join(shared.alloc, &.{ item.path, de.name }) catch continue;
+        const child = ScanItem{ .path = child_path, .depth = item.depth + 1 };
+        // Increment remaining BEFORE pushing so workers see it immediately
+        _ = shared.remaining.fetchAdd(1, .seq_cst);
+        shared.queue_mu.lock();
+        shared.queue.append(child) catch {
+            shared.queue_mu.unlock();
+            shared.alloc.free(child_path);
+            _ = shared.remaining.fetchSub(1, .seq_cst);
+            continue;
+        };
+        shared.queue_mu.unlock();
     }
 }
 
 // ── Parallel size calculation ─────────────────────────────────────────────────
 
 const SizeCtx = struct {
-    alloc: Allocator,
-    entries: []Entry,
-    start: usize,
-    stride: usize,
-    done: *std.atomic.Value(u64),
+    alloc:    Allocator,
+    entries:  []Entry,
+    next_idx: *std.atomic.Value(usize), // shared fetch-add counter — work-stealing
+    done:     *std.atomic.Value(u64),
 };
 
 fn sizeWorker(ctx: SizeCtx) void {
-    var i = ctx.start;
-    while (i < ctx.entries.len) : (i += ctx.stride) {
+    while (true) {
+        const i = ctx.next_idx.fetchAdd(1, .monotonic);
+        if (i >= ctx.entries.len) break;
         ctx.entries[i].size_bytes = calcDirSize(ctx.alloc, ctx.entries[i].path);
         _ = ctx.done.fetchAdd(1, .monotonic);
     }
@@ -456,30 +515,38 @@ fn sizeWorker(ctx: SizeCtx) void {
 fn calcSizesParallel(alloc: Allocator, entries: []Entry, num_threads: usize) !void {
     if (entries.len == 0) return;
     const n = @min(num_threads, entries.len);
-    var done = std.atomic.Value(u64).init(0);
+    var next_idx = std.atomic.Value(usize).init(0);
+    var done     = std.atomic.Value(u64).init(0);
 
     const threads = try alloc.alloc(Thread, n);
     defer alloc.free(threads);
 
     for (0..n) |i| {
         threads[i] = try Thread.spawn(.{}, sizeWorker, .{SizeCtx{
-            .alloc = alloc,
-            .entries = entries,
-            .start = i,
-            .stride = n,
-            .done = &done,
+            .alloc    = alloc,
+            .entries  = entries,
+            .next_idx = &next_idx,
+            .done     = &done,
         }});
     }
 
+    // Progress bar
     const stderr = std.fs.File.stderr().deprecatedWriter();
-    const total = entries.len;
+    const total  = entries.len;
+    const bar_w  = 28;
     while (done.load(.monotonic) < total) {
-        const d = done.load(.monotonic);
+        const d   = done.load(.monotonic);
         const pct = if (total > 0) (d * 100) / total else 100;
-        stderr.print("\r  Calculating sizes... {d}/{d} ({d}%)   ", .{ d, total, pct }) catch {};
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        const filled = (pct * bar_w) / 100;
+        stderr.writeAll("\r  ") catch {};
+        for (0..bar_w) |b| {
+            if (b < filled) stderr.writeAll("\x1b[92m█\x1b[0m") catch {}
+            else             stderr.writeAll("\x1b[2m░\x1b[0m")  catch {};
+        }
+        stderr.print("  \x1b[1;37m{d}%\x1b[0m  \x1b[2m{d}/{d}\x1b[0m  ", .{ pct, d, total }) catch {};
+        std.Thread.sleep(80 * std.time.ns_per_ms);
     }
-    stderr.writeAll("\r                                          \r") catch {};
+    stderr.writeAll("\r" ++ " " ** 72 ++ "\r") catch {};
 
     for (threads) |t| t.join();
 }
@@ -506,75 +573,129 @@ fn printTable(entries: []const Entry, config: *const Config, total_bytes: u64) v
         max_kind = @max(max_kind, e.kindLabel().len);
         max_path = @max(max_path, e.path.len);
     }
-    max_path = @min(max_path, 80);
+    max_path = @min(max_path, 60);
 
-    // Header
+    // Col widths: type=max_kind  size=10  age=5  path=max_path
+    const row_inner = max_kind + 2 + 10 + 2 + 5 + 2 + max_path; // spaces between cols
+
+    // ── Box top ────────────────────────────────────────────────────────────────
+    if (!nc) stdout.writeAll(ansi.dim) catch {};
+    stdout.writeAll("  ╭") catch {};
+    for (0..max_kind + 2) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┬") catch {};
+    for (0..12) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┬") catch {};
+    for (0..7) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┬") catch {};
+    for (0..max_path + 2) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("╮\n") catch {};
+    if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+    // ── Header row ─────────────────────────────────────────────────────────────
     if (!nc) stdout.writeAll(ansi.bold_white) catch {};
     var hdr_buf: [64]u8 = undefined;
-    stdout.print("  {s}  {s:>10}  {s:>7}  {s}\n", .{
-        padRight(&hdr_buf, "Type", max_kind), "Size", "Age(d)", "Path",
+    var path_hdr_buf: [128]u8 = undefined;
+    stdout.print("  │ {s} │ {s:>10} │ {s:>5} │ {s} │\n", .{
+        padRight(&hdr_buf, "TYPE", max_kind),
+        "SIZE", "DAYS",
+        padRight(&path_hdr_buf, "PATH", max_path),
     }) catch {};
     if (!nc) stdout.writeAll(ansi.reset) catch {};
 
-    // Separator
-    const sep_alloc = std.heap.page_allocator;
-    const sep_len = max_kind + 28 + max_path;
-    const sep = sep_alloc.alloc(u8, sep_len) catch return;
-    defer sep_alloc.free(sep);
-    @memset(sep, '-');
+    // ── Header divider ─────────────────────────────────────────────────────────
     if (!nc) stdout.writeAll(ansi.dim) catch {};
-    stdout.print("  {s}\n", .{sep}) catch {};
+    stdout.writeAll("  ├") catch {};
+    for (0..max_kind + 2) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┼") catch {};
+    for (0..12) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┼") catch {};
+    for (0..7) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┼") catch {};
+    for (0..max_path + 2) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┤\n") catch {};
     if (!nc) stdout.writeAll(ansi.reset) catch {};
 
-    // Rows
+    // ── Rows ───────────────────────────────────────────────────────────────────
     for (entries) |*e| {
         var sb: [32]u8 = undefined;
         var ab: [16]u8 = undefined;
         const size_s = e.sizeStr(&sb);
-        const age_s = std.fmt.bufPrint(&ab, "{d}", .{e.ageDays()}) catch "?";
+        const age_s  = std.fmt.bufPrint(&ab, "{d}", .{e.ageDays()}) catch "?";
 
-        // Truncate path if needed
-        const path_disp = if (e.path.len > max_path) e.path[e.path.len - max_path ..] else e.path;
+        // Left-truncate long paths with ellipsis
+        const path_disp = if (e.path.len > max_path)
+            e.path[e.path.len - max_path + 1 ..]
+        else
+            e.path;
+        const path_prefix: []const u8 = if (e.path.len > max_path) "…" else " ";
 
         const size_color: []const u8 = if (nc) "" else blk: {
-            if (e.size_bytes > 1 << 30) break :blk ansi.bold_red;
+            if (e.size_bytes > 1 << 30) break :blk ansi.bright_red;
             if (e.size_bytes > 100 << 20) break :blk ansi.bold_yellow;
-            break :blk ansi.green;
+            break :blk ansi.bright_green;
         };
 
+        if (!nc) stdout.writeAll(ansi.dim) catch {};
+        stdout.writeAll("  │ ") catch {};
+        if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+        // Type column (colored)
         if (!nc) stdout.writeAll(e.kind.colorCode()) catch {};
         var kind_buf: [64]u8 = undefined;
-        stdout.print("  {s}", .{padRight(&kind_buf, e.kindLabel(), max_kind)}) catch {};
+        stdout.print("{s}", .{padRight(&kind_buf, e.kindLabel(), max_kind)}) catch {};
         if (!nc) stdout.writeAll(ansi.reset) catch {};
-        if (!nc) stdout.writeAll(size_color) catch {};
-        stdout.print("  {s:>10}", .{size_s}) catch {};
-        if (!nc) stdout.writeAll(ansi.reset) catch {};
-        stdout.print("  {s:>7}", .{age_s}) catch {};
+
         if (!nc) stdout.writeAll(ansi.dim) catch {};
-        stdout.print("  {s}\n", .{path_disp}) catch {};
+        stdout.writeAll(" │ ") catch {};
+        if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+        // Size column
+        if (!nc) stdout.writeAll(size_color) catch {};
+        stdout.print("{s:>10}", .{size_s}) catch {};
+        if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+        if (!nc) stdout.writeAll(ansi.dim) catch {};
+        stdout.writeAll(" │ ") catch {};
+        if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+        // Age column
+        if (!nc) stdout.writeAll(ansi.dim) catch {};
+        stdout.print("{s:>5}", .{age_s}) catch {};
+        if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+        if (!nc) stdout.writeAll(ansi.dim) catch {};
+        stdout.writeAll(" │ ") catch {};
+
+        // Path column
+        stdout.print("{s}{s}", .{ path_prefix, path_disp }) catch {};
+        // Pad to max_path
+        const printed = path_disp.len + 1; // +1 for prefix char
+        if (printed < max_path) {
+            for (0..max_path - printed) |_| stdout.writeAll(" ") catch {};
+        }
+        stdout.writeAll(" │\n") catch {};
         if (!nc) stdout.writeAll(ansi.reset) catch {};
     }
 
-    // Footer separator
+    // ── Box bottom ─────────────────────────────────────────────────────────────
     if (!nc) stdout.writeAll(ansi.dim) catch {};
-    stdout.print("  {s}\n", .{sep}) catch {};
+    stdout.writeAll("  ╰") catch {};
+    for (0..max_kind + 2) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┴") catch {};
+    for (0..12) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┴") catch {};
+    for (0..7) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┴") catch {};
+    for (0..max_path + 2) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("╯\n") catch {};
     if (!nc) stdout.writeAll(ansi.reset) catch {};
 
-    // Summary line
-    var tb: [32]u8 = undefined;
-    stdout.print("\n  ", .{}) catch {};
-    if (!nc) stdout.writeAll(ansi.bold_white) catch {};
-    stdout.print("{d} director{s}", .{ entries.len, if (entries.len == 1) "y" else "ies" }) catch {};
-    if (!nc) stdout.writeAll(ansi.reset ++ "  " ++ ansi.bold_yellow) catch {};
-    stdout.print("  {s} total\n", .{fmtSize(total_bytes, &tb)}) catch {};
-    if (!nc) stdout.writeAll(ansi.reset) catch {};
-
-    // Per-kind breakdown
+    // ── Summary panel ──────────────────────────────────────────────────────────
     var counts = [_]struct { label: []const u8, clr: []const u8, n: u32, b: u64 }{
-        .{ .label = "Python venv", .clr = ansi.yellow, .n = 0, .b = 0 },
-        .{ .label = "Node / JS", .clr = ansi.green, .n = 0, .b = 0 },
-        .{ .label = "Rust target", .clr = ansi.red, .n = 0, .b = 0 },
-        .{ .label = "Custom", .clr = ansi.blue, .n = 0, .b = 0 },
+        .{ .label = "Python venv", .clr = ansi.yellow,  .n = 0, .b = 0 },
+        .{ .label = "Node / JS",   .clr = ansi.green,   .n = 0, .b = 0 },
+        .{ .label = "Rust target", .clr = ansi.red,     .n = 0, .b = 0 },
+        .{ .label = "Custom",      .clr = ansi.blue,    .n = 0, .b = 0 },
     };
     for (entries) |*e| {
         const idx: usize = switch (e.kind) {
@@ -586,13 +707,72 @@ fn printTable(entries: []const Entry, config: *const Config, total_bytes: u64) v
         counts[idx].n += 1;
         counts[idx].b += e.size_bytes;
     }
+
+    const panel_w = row_inner + 4; // inner width of summary panel
+    const summary_inner = 46;
+
+    stdout.writeAll("\n") catch {};
+    if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
+    stdout.writeAll("  ╔") catch {};
+    for (0..summary_inner) |_| stdout.writeAll("═") catch {};
+    stdout.writeAll("╗\n") catch {};
+    stdout.print("  ║  \x1b[1;37mSUMMARY\x1b[1;36m", .{}) catch {};
+    for (0..summary_inner - 9) |_| stdout.writeAll(" ") catch {};
+    stdout.writeAll("║\n") catch {};
+    stdout.writeAll("  ╠") catch {};
+    for (0..summary_inner) |_| stdout.writeAll("═") catch {};
+    stdout.writeAll("╣\n") catch {};
+    if (!nc) stdout.writeAll(ansi.reset) catch {};
+
     for (counts) |c| {
         if (c.n == 0) continue;
         var kb: [32]u8 = undefined;
+        const size_str = fmtSize(c.b, &kb);
+        if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
+        stdout.writeAll("  ║  ") catch {};
         if (!nc) stdout.writeAll(c.clr) catch {};
-        stdout.print("    {s:<14}  ×{d}  {s}\n", .{ c.label, c.n, fmtSize(c.b, &kb) }) catch {};
+        stdout.print("{s:<14}", .{c.label}) catch {};
+        if (!nc) stdout.writeAll(ansi.dim) catch {};
+        stdout.print("  ·  {d} dir{s}  ·  ", .{ c.n, if (c.n == 1) "" else "s" }) catch {};
+        if (!nc) stdout.writeAll(ansi.bold_yellow) catch {};
+        stdout.print("{s}", .{size_str}) catch {};
         if (!nc) stdout.writeAll(ansi.reset) catch {};
+        // Pad to panel width
+        const used = 2 + 14 + 6 + 3 + if (c.n >= 10) @as(usize, 2) else @as(usize, 1) + 3 + 6 + 3 + size_str.len;
+        const remaining_space = if (summary_inner > used + 4) summary_inner - used - 4 else @as(usize, 0);
+        for (0..remaining_space) |_| stdout.writeAll(" ") catch {};
+        if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
+        stdout.writeAll("  ║\n") catch {};
     }
+
+    if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
+    stdout.writeAll("  ╠") catch {};
+    for (0..summary_inner) |_| stdout.writeAll("═") catch {};
+    stdout.writeAll("╣\n") catch {};
+    stdout.writeAll("  ║  ") catch {};
+    if (!nc) stdout.writeAll(ansi.bold_white) catch {};
+    var tb: [32]u8 = undefined;
+    const total_str = fmtSize(total_bytes, &tb);
+    stdout.print("TOTAL  ·  {d} dir{s}  ·  ", .{
+        entries.len, if (entries.len == 1) "" else "s",
+    }) catch {};
+    if (!nc) stdout.writeAll(ansi.bold_yellow) catch {};
+    stdout.print("{s}", .{total_str}) catch {};
+    if (!nc) stdout.writeAll(ansi.dim) catch {};
+    stdout.writeAll("  reclaimable") catch {};
+    if (!nc) stdout.writeAll(ansi.reset) catch {};
+    // Pad
+    const total_used = 7 + 4 + @as(usize, if (entries.len >= 10) 2 else 1) + 10 + 4 + total_str.len + 13;
+    const total_pad = if (summary_inner > total_used + 4) summary_inner - total_used - 4 else @as(usize, 0);
+    for (0..total_pad) |_| stdout.writeAll(" ") catch {};
+    if (!nc) stdout.writeAll(ansi.bold_cyan) catch {};
+    stdout.writeAll("  ║\n") catch {};
+    stdout.writeAll("  ╚") catch {};
+    for (0..summary_inner) |_| stdout.writeAll("═") catch {};
+    stdout.writeAll("╝\n") catch {};
+    if (!nc) stdout.writeAll(ansi.reset) catch {};
+
+    _ = panel_w; // suppress unused warning
 }
 
 fn writeJson(entries: []const Entry, writer: anytype) !void {
@@ -659,16 +839,54 @@ fn interactiveSelect(alloc: Allocator, entries: []const Entry, no_color: bool) !
     const stdin = std.fs.File.stdin().deprecatedReader();
     var selected = ArrayList([]const u8).init(alloc);
 
-    stdout.writeAll("\n  Select directories to delete:\n") catch {};
+    const picker_w: usize = 60;
+    stdout.writeAll("\n") catch {};
+    if (!no_color) stdout.writeAll(ansi.bold_cyan) catch {};
+    stdout.writeAll("  ┌") catch {};
+    for (0..picker_w) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┐\n") catch {};
+    stdout.print("  │  \x1b[1;37mSELECT DIRECTORIES TO DELETE\x1b[1;36m", .{}) catch {};
+    for (0..picker_w - 31) |_| stdout.writeAll(" ") catch {};
+    stdout.writeAll("│\n") catch {};
+    stdout.writeAll("  ├") catch {};
+    for (0..picker_w) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┤\n") catch {};
+    if (!no_color) stdout.writeAll(ansi.reset) catch {};
+
     for (entries, 1..) |*e, i| {
         var sb: [32]u8 = undefined;
+        const size_s = e.sizeStr(&sb);
+        if (!no_color) stdout.writeAll(ansi.bold_cyan) catch {};
+        stdout.writeAll("  │ ") catch {};
+        if (!no_color) stdout.writeAll(ansi.bold_white) catch {};
+        stdout.print("{d:>3}  ", .{i}) catch {};
         if (!no_color) stdout.writeAll(e.kind.colorCode()) catch {};
-        stdout.print("  {d:>4}.  {s:<14}  {s:>10}  {s}\n", .{
-            i, e.kindLabel(), e.sizeStr(&sb), e.path,
-        }) catch {};
-        if (!no_color) stdout.writeAll(ansi.reset) catch {};
+        stdout.print("{s:<14} ", .{e.kindLabel()}) catch {};
+        // size colored
+        const sc: []const u8 = if (no_color) "" else if (e.size_bytes > 1 << 30) ansi.bright_red
+            else if (e.size_bytes > 100 << 20) ansi.bold_yellow else ansi.bright_green;
+        if (!no_color) stdout.writeAll(sc) catch {};
+        stdout.print("{s:>10}  ", .{size_s}) catch {};
+        if (!no_color) stdout.writeAll(ansi.dim) catch {};
+        const path_max = picker_w - 33;
+        const path_disp = if (e.path.len > path_max) e.path[e.path.len - path_max..] else e.path;
+        stdout.print("{s}", .{path_disp}) catch {};
+        // pad
+        if (path_disp.len < path_max) for (0..path_max - path_disp.len) |_| stdout.writeAll(" ") catch {};
+        if (!no_color) stdout.writeAll(ansi.reset ++ ansi.bold_cyan) catch {};
+        stdout.writeAll(" │\n") catch {};
     }
-    stdout.writeAll("\n  Enter numbers (1,3,5 | 2-5 | all), blank=cancel:\n  > ") catch {};
+    if (!no_color) stdout.writeAll(ansi.bold_cyan) catch {};
+    stdout.writeAll("  └") catch {};
+    for (0..picker_w) |_| stdout.writeAll("─") catch {};
+    stdout.writeAll("┘\n") catch {};
+    if (!no_color) stdout.writeAll(ansi.reset) catch {};
+
+    if (!no_color) stdout.writeAll(ansi.dim) catch {};
+    stdout.writeAll("  enter: 1,3  │  2-5  │  all  │  blank=cancel\n") catch {};
+    if (!no_color) stdout.writeAll(ansi.reset ++ ansi.bold_cyan) catch {};
+    stdout.writeAll("  ❯ ") catch {};
+    if (!no_color) stdout.writeAll(ansi.reset) catch {};
 
     var line_buf: [1024]u8 = undefined;
     const raw = try stdin.readUntilDelimiterOrEof(&line_buf, '\n') orelse return selected;
@@ -721,24 +939,26 @@ fn interactiveSelect(alloc: Allocator, entries: []const Entry, no_color: bool) !
 // ── Spinner thread ────────────────────────────────────────────────────────────
 
 const SpinCtx = struct {
-    running: *std.atomic.Value(bool),
-    count: *std.atomic.Value(u64),
+    running:  *std.atomic.Value(bool),
+    count:    *std.atomic.Value(u64),
     no_color: bool,
 };
 
 fn spinWorker(ctx: SpinCtx) void {
-    const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+    const frames = [_][]const u8{ "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷" };
     var f: usize = 0;
     const w = std.fs.File.stderr().deprecatedWriter();
     while (ctx.running.load(.monotonic)) {
         const c = ctx.count.load(.monotonic);
-        if (!ctx.no_color) w.writeAll(ansi.cyan) catch {};
-        w.print("\r  {s}  found {d}  ", .{ frames[f % frames.len], c }) catch {};
-        if (!ctx.no_color) w.writeAll(ansi.reset) catch {};
+        if (!ctx.no_color) {
+            w.print("\r  \x1b[1;36m{s}\x1b[0m  \x1b[2mSCANNING\x1b[0m  \x1b[1;33m{d} found\x1b[0m  ", .{ frames[f % frames.len], c }) catch {};
+        } else {
+            w.print("\r  {s}  SCANNING  {d} found  ", .{ frames[f % frames.len], c }) catch {};
+        }
         f += 1;
         std.Thread.sleep(80 * std.time.ns_per_ms);
     }
-    w.writeAll("\r                              \r") catch {};
+    w.writeAll("\r" ++ " " ** 60 ++ "\r") catch {};
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -753,7 +973,12 @@ pub fn main() !void {
         stderr.print("Argument error: {s}\nRun with --help for usage.\n", .{@errorName(err)}) catch {};
         std.process.exit(1);
     };
-    defer config.extra_targets.deinit();
+    defer {
+        alloc.free(config.root);
+        if (config.export_path) |ep| alloc.free(ep);
+        for (config.extra_targets.items) |t| alloc.free(t);
+        config.extra_targets.deinit();
+    }
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -779,36 +1004,75 @@ pub fn main() !void {
         probe.close();
     }
 
-    // Banner
-    if (!config.no_color) try stdout.writeAll(ansi.bold_cyan);
-    try stdout.writeAll("  mouser");
-    if (!config.no_color) try stdout.writeAll(ansi.reset ++ ansi.dim);
-    try stdout.print("  scanning {s}", .{root_abs});
-    if (config.depth) |d| try stdout.print("  depth≤{d}", .{d});
-    if (config.filter != .all) try stdout.print("  [{s}]", .{@tagName(config.filter)});
-    if (config.no_size) try stdout.writeAll("  [no-size]");
-    try stdout.writeAll("\n");
-    if (!config.no_color) try stdout.writeAll(ansi.reset);
+    // Auto thread count
+    if (config.num_threads == 0) {
+        config.num_threads = std.Thread.getCpuCount() catch 4;
+    }
 
-    // Scan
+    // Banner
+    if (!config.no_color) {
+        try stdout.writeAll("\n  \x1b[1;36m╔══════════════════════════════════════╗\x1b[0m\n");
+        try stdout.writeAll("  \x1b[1;36m║\x1b[0m  \x1b[1;37m░▒▓ \x1b[1;96mMOUSER\x1b[0m\x1b[1;37m ▓▒░\x1b[0m\x1b[2m  v1.0  dependency reclaimer  \x1b[0m\x1b[1;36m║\x1b[0m\n");
+        try stdout.writeAll("  \x1b[1;36m╚══════════════════════════════════════╝\x1b[0m\n\n");
+        try stdout.writeAll(ansi.dim);
+    } else {
+        try stdout.writeAll("\n  ╔══════════════════════════════════════╗\n");
+        try stdout.writeAll("  ║  MOUSER v1.0  dependency reclaimer  ║\n");
+        try stdout.writeAll("  ╚══════════════════════════════════════╝\n\n");
+    }
+    try stdout.print("  scanning  {s}", .{root_abs});
+    if (!config.no_color) try stdout.writeAll(ansi.reset);
+    if (config.depth) |d| try stdout.print("  depth≤{d}", .{d});
+    if (config.filter != .all) try stdout.print("  filter:{s}", .{@tagName(config.filter)});
+    if (config.no_size) try stdout.writeAll("  no-size");
+    try stdout.print("  threads:{d}", .{config.num_threads});
+    try stdout.writeAll("\n\n");
+
+    // Scan — parallel work-stealing scanner
     var entries = ArrayList(Entry).init(alloc);
     defer {
         for (entries.items) |*e| alloc.free(e.path);
         entries.deinit();
     }
 
-    var scan_mu = Mutex{};
+    var entries_mu = Mutex{};
     var found_count = std.atomic.Value(u64).init(0);
     const t0 = std.time.milliTimestamp();
 
     var spin_running = std.atomic.Value(bool).init(true);
     const spin_thread = try Thread.spawn(.{}, spinWorker, .{SpinCtx{
-        .running = &spin_running,
-        .count = &found_count,
+        .running  = &spin_running,
+        .count    = &found_count,
         .no_color = config.no_color,
     }});
 
-    try scanRoot(alloc, root_abs, &config, &entries, &scan_mu, &found_count);
+    {
+        // Root item starts with remaining=1
+        const root_copy = try alloc.dupe(u8, root_abs);
+        var shared = ScanShared{
+            .alloc       = alloc,
+            .queue       = ArrayList(ScanItem).init(alloc),
+            .queue_mu    = Mutex{},
+            .entries     = &entries,
+            .entries_mu  = &entries_mu,
+            .config      = &config,
+            .found_count = &found_count,
+            .remaining   = std.atomic.Value(i64).init(1),
+        };
+        defer {
+            for (shared.queue.items) |item| alloc.free(item.path);
+            shared.queue.deinit();
+        }
+        try shared.queue.append(.{ .path = root_copy, .depth = 0 });
+
+        const n_scan = config.num_threads;
+        const scan_threads = try alloc.alloc(Thread, n_scan);
+        defer alloc.free(scan_threads);
+        for (0..n_scan) |i| {
+            scan_threads[i] = try Thread.spawn(.{}, scanWorker, .{&shared});
+        }
+        for (scan_threads) |t| t.join();
+    }
 
     spin_running.store(false, .monotonic);
     spin_thread.join();
